@@ -33,7 +33,9 @@
 //!    committing (a segment is uploaded first and referenced afterwards); the
 //!    wall clock is read before the keep set is built, so anything uploaded
 //!    during the scan is too young by construction. The knob cannot go below
-//!    `MIN_OBJECT_AGE_FLOOR`.
+//!    `MIN_OBJECT_AGE_FLOOR`. Note that S3 dates a multipart object from the
+//!    start of its upload, so on S3 the effective margin is the knob minus the
+//!    upload duration; the 24-hour default is sized for that, the floor is not.
 //! 3. Refuse to delete anything when the keep set protects none of the listed
 //!    objects: a deployment whose search storage does not match its metadata
 //!    (wrong directory, wrong prefix) would otherwise lose every segment it
