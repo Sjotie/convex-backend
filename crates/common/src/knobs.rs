@@ -166,6 +166,12 @@ pub static APP_METRICS_SEED_STARTUP_JITTER: LazyLock<Duration> = LazyLock::new(|
 pub static KILL_APP_METRICS_SEED_WORKER: LazyLock<bool> =
     LazyLock::new(|| env_config("KILL_APP_METRICS_SEED_WORKER", false));
 
+/// Minimum spacing between a deployment's deploy reports to big brain. Deploys
+/// landing within this window of the previous report coalesce into a single
+/// request carrying the newest deploy time.
+pub static DEPLOY_REPORT_MIN_INTERVAL: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_secs(env_config("DEPLOY_REPORT_MIN_INTERVAL_SECS", 2)));
+
 /// Databricks query id (UUID) for the conductor app-metrics seed query, which
 /// takes a comma-separated `instance_names` parameter and returns rolled up
 /// usage data. Defaults to the the empty string, which means the worker will be
@@ -536,14 +542,14 @@ pub static SCHEDULED_JOB_RETENTION: LazyLock<Duration> = LazyLock::new(|| {
 
 /// Maximum number of scheduled jobs to garbage collect in a single transaction
 pub static SCHEDULED_JOB_GARBAGE_COLLECTION_BATCH_SIZE: LazyLock<usize> =
-    LazyLock::new(|| env_config("SCHEDULED_JOB_GARBAGE_COLLECTION_BATCH_SIZE", 1000));
+    LazyLock::new(|| env_config("SCHEDULED_JOB_GARBAGE_COLLECTION_BATCH_SIZE", 100));
 
 /// Delay between runs of the scheduled job garbage collector.
 /// If too low, the garbage collector will run frequently with small batches,
 /// which is less efficient. If too high, the garbage collector might fall
 /// behind.
 pub static SCHEDULED_JOB_GARBAGE_COLLECTION_DELAY: LazyLock<Duration> =
-    LazyLock::new(|| Duration::from_secs(env_config("SCHEDULED_JOB_GARBAGE_COLLECTION_DELAY", 10)));
+    LazyLock::new(|| Duration::from_secs(env_config("SCHEDULED_JOB_GARBAGE_COLLECTION_DELAY", 1)));
 
 /// Exclusive upper bound, in seconds, for the stable random offset applied to
 /// cron runs so jobs sharing a schedule don't all fire at once and spike load.
@@ -1438,6 +1444,8 @@ pub static FUNRUN_MAX_CPU_PRESSURE: LazyLock<f64> =
 /// larger than (N / 15) where N is the number of instances with lambdas.
 ///
 /// You can check go/num-instances-with-lambdas
+///
+/// NOTE: the true value of this is overridden in big brain knob overrides
 pub static AWS_LAMBDA_DEPLOY_SPLAY: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("AWS_LAMBDA_DEPLOY_SPLAY_SECONDS", 32400)));
 
@@ -1535,6 +1543,14 @@ pub static USAGE_TRACKING_WORKER_SLOW_TRACE_THRESHOLD: LazyLock<Duration> = Lazy
         120,
     ))
 });
+
+/// How many `_file_storage` documents the deployment must hold before the
+/// usage gauges' file storage total resumes from its previous sync rather than
+/// syncing the storage tables again. Resuming catches up along the document
+/// log, which reads every table's revisions in the timestamp range, not just
+/// `_file_storage`'s, so below this many documents a fresh sync is cheaper.
+pub static FILE_STORAGE_SIZE_MIN_DOCUMENTS_TO_RESUME: LazyLock<i64> =
+    LazyLock::new(|| env_config("FILE_STORAGE_SIZE_MIN_DOCUMENTS_TO_RESUME", 4096));
 
 /// The number of events we can accumulate in the buffer that's used to send
 /// events from our business logic to our firehose client.
@@ -1716,7 +1732,7 @@ pub static MAX_USER_MODULES: LazyLock<usize> =
 ///
 /// Conductor will build a zip of this size in memory during code push.
 pub static MAX_ZIPPED_PACKAGES_SIZE: LazyLock<usize> =
-    LazyLock::new(|| env_config("MAX_ZIPPED_PACKAGES_SIZE", 45_000_000));
+    LazyLock::new(|| env_config("MAX_ZIPPED_PACKAGES_SIZE", 90_000_000));
 
 /// Percentage of request traces that should sampled.
 ///
@@ -1790,10 +1806,10 @@ pub static USHER_SERVICE_CACHE_MAX_ENTRIES: LazyLock<u64> =
     LazyLock::new(|| env_config("USHER_SERVICE_CACHE_MAX_ENTRIES", 1000));
 
 /// Usher cache for instance -> partition lookups.
-/// Arbitrarily chosen cache size. From metrics, a single Usher processes
-/// requests for about 250 unique instances in a 10 minute period.
+/// The five-minute idle expiry bounds idle memory, while the higher capacity
+/// leaves headroom for the per-host working set without size-based churn.
 pub static USHER_PARTITION_CACHE_MAX_ENTRIES: LazyLock<u64> =
-    LazyLock::new(|| env_config("USHER_PARTITION_CACHE_MAX_ENTRIES", 1000));
+    LazyLock::new(|| env_config("USHER_PARTITION_CACHE_MAX_ENTRIES", 100_000));
 
 /// Initial backoff duration when retrying a query in the sync worker.
 pub static SYNC_WORKER_QUERY_RETRY_INITIAL_BACKOFF_MS: LazyLock<Duration> = LazyLock::new(|| {
@@ -2049,6 +2065,13 @@ pub static INITIAL_PERSISTENCE_WRITES_BACKOFF: LazyLock<Duration> = LazyLock::ne
 pub static MAX_PERSISTENCE_WRITES_BACKOFF: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_millis(env_config("MAX_PERSISTENCE_WRITES_BACKOFF_MS", 10 * 1000))
 });
+
+/// Whether newly created database indexes receive persistence IDs.
+///
+/// The allocator's high-water mark remains durable while allocation is
+/// disabled.
+pub static PERSISTENCE_INDEX_ID_ALLOCATION_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_config("PERSISTENCE_INDEX_ID_ALLOCATION_ENABLED", true));
 
 /// HTTP/2 keepalive PING interval for proxied reqwest clients. Without
 /// keepalive a connection the peer drops without a TCP FIN/RST (e.g. a

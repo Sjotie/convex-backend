@@ -57,6 +57,7 @@ use common::{
         index::{
             database_index::IndexedFields,
             index_validation_error,
+            IndexConfig,
             IndexMetadata,
         },
         schema::{
@@ -646,6 +647,22 @@ pub async fn create_storage<RT: Runtime>(
 const DEFAULT_AUDIT_LOG_LIMIT: usize = 15;
 const MAX_AUDIT_LOG_LIMIT: usize = 100;
 
+fn ensure_export_file_storage_within_limit(
+    format: ExportFormat,
+    latest_file_storage_size: Option<u64>,
+) -> anyhow::Result<()> {
+    if matches!(
+        format,
+        ExportFormat::Zip {
+            include_storage: true
+        }
+    ) && let Some(file_storage_size) = latest_file_storage_size
+    {
+        ::exports::ensure_file_storage_export_size(file_storage_size)?;
+    }
+    Ok(())
+}
+
 impl<RT: Runtime> Application<RT> {
     pub async fn initialize_storage(
         runtime: RT,
@@ -933,7 +950,7 @@ impl<RT: Runtime> Application<RT> {
             usage_event_logger.clone(),
             Arc::new(log_manager_client.clone()),
             deployment_name.clone(),
-        );
+        )?;
 
         let workers = WorkerHandles {
             usage_gauges_tracking_worker,
@@ -995,8 +1012,12 @@ impl<RT: Runtime> Application<RT> {
         self.runner.clone()
     }
 
-    pub async fn mint_ai_gateway_jwt(&self, claims: AttributionClaims) -> anyhow::Result<String> {
-        self.runner.mint_ai_gateway_jwt(claims).await
+    pub async fn mint_ai_gateway_jwt(
+        &self,
+        identity: &Identity,
+        claims: AttributionClaims,
+    ) -> anyhow::Result<String> {
+        self.runner.mint_ai_gateway_jwt(identity, claims).await
     }
 
     pub fn metrics_log(&self, identity: &Identity) -> anyhow::Result<FunctionMetricsLog<'_, RT>> {
@@ -1629,6 +1650,12 @@ impl<RT: Runtime> Application<RT> {
         expiration_ts_ns: Option<u64>,
     ) -> anyhow::Result<DeveloperDocumentId> {
         identity.require_operation(DeploymentOp::CreateBackups)?;
+        ensure_export_file_storage_within_limit(
+            format,
+            self.workers
+                .usage_gauges_tracking_worker
+                .latest_file_storage_size(),
+        )?;
         if let Some(expiration_ts_ns) = expiration_ts_ns {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2673,6 +2700,13 @@ impl<RT: Runtime> Application<RT> {
         caller: FunctionCaller,
         component: ComponentId,
     ) -> anyhow::Result<Result<FunctionReturn, FunctionError>> {
+        anyhow::ensure!(
+            module.environment == ModuleEnvironment::Isolate,
+            ErrorMetadata::bad_request(
+                "InvalidTestQueryEnvironment",
+                "Test queries must use the Convex runtime.",
+            ),
+        );
         let request_id = request_context.request_id.clone();
         let block_logging = self
             .log_visibility
@@ -2954,29 +2988,27 @@ impl<RT: Runtime> Application<RT> {
         let namespace = TableNamespace::by_component_TODO();
         for (index_name, index_fields) in indexes.into_iter() {
             let index_fields = self._validate_user_defined_index_fields(index_fields)?;
-            let index_metadata =
-                IndexMetadata::new_backfilling(*tx.begin_timestamp(), index_name, index_fields);
-            let mut model = IndexModel::new(&mut tx);
-            if let Some(existing_index_metadata) = model
-                .pending_index_metadata(namespace, &index_metadata.name)?
-                .or(model.enabled_index_metadata(namespace, &index_metadata.name)?)
-            {
-                if !index_metadata
-                    .config
-                    .same_spec(&existing_index_metadata.config)
+            let existing_index_metadata = {
+                let mut model = IndexModel::new(&mut tx);
+                model
+                    .pending_index_metadata(namespace, &index_name)?
+                    .or(model.enabled_index_metadata(namespace, &index_name)?)
+            };
+            if let Some(existing_index_metadata) = existing_index_metadata {
+                if let IndexConfig::Database { spec, .. } = &existing_index_metadata.config
+                    && spec.fields == index_fields
                 {
-                    IndexModel::new(&mut tx)
-                        .drop_index(existing_index_metadata.id())
-                        .await?;
-                    IndexModel::new(&mut tx)
-                        .add_system_index(namespace, index_metadata)
-                        .await?;
+                    continue;
                 }
-            } else {
                 IndexModel::new(&mut tx)
-                    .add_system_index(namespace, index_metadata)
+                    .drop_index(existing_index_metadata.id())
                     .await?;
             }
+            let index_metadata =
+                IndexMetadata::new_backfilling(*tx.begin_timestamp(), index_name, index_fields);
+            IndexModel::new(&mut tx)
+                .add_system_index(namespace, index_metadata)
+                .await?;
         }
         self.commit(tx, "add_system_indexes").await?;
         Ok(())
