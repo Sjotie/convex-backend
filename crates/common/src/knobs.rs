@@ -882,12 +882,13 @@ pub static SEARCH_SEGMENT_GC_MODE: LazyLock<String> =
 /// committing, and absorbs clock skew between storage and the backend. Values
 /// below the collector's floor (10 minutes) are rejected.
 ///
-/// On S3 the age is measured from `LastModified`, which for a multipart
-/// upload is the time the upload was *initiated*, not completed: a segment
-/// that took an hour to upload looks an hour older than it is. Keep this
-/// value well above the longest segment upload a deployment can see; the
-/// 24-hour default is meant for that. Local storage reports the last write,
-/// so it does not have this skew.
+/// Objects of a running index build are protected by the build registry
+/// (the round is deferred), not by this age; the age protects objects of
+/// builds that started after the round read its clock, and absorbs clock
+/// skew. On S3 `LastModified` of a multipart object is the time the upload
+/// was *initiated*; that only matters for skew, since the build that
+/// initiated it is either still registered or committed. Local storage
+/// reports the last write.
 pub static SEARCH_SEGMENT_GC_MIN_OBJECT_AGE: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(env_config(
         "SEARCH_SEGMENT_GC_MIN_OBJECT_AGE_SECONDS",
@@ -903,8 +904,9 @@ pub static SEARCH_SEGMENT_GC_MAX_DELETES_PER_ROUND: LazyLock<usize> =
 
 /// Upper bound on the wall-clock duration of one search segment garbage
 /// collection round (keep set, listing and deletes together). A round that
-/// exceeds it is abandoned with an error and retried by the next round, so a
-/// hung storage call cannot hold the system table cleanup worker.
+/// exceeds it is abandoned with an error and retried by the next round. This
+/// bounds the round's asynchronous waits (a pending storage request); a
+/// synchronous filesystem call cannot be interrupted by it.
 pub static SEARCH_SEGMENT_GC_ROUND_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(env_config(
         "SEARCH_SEGMENT_GC_ROUND_TIMEOUT_SECONDS",

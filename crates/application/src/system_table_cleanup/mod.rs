@@ -550,8 +550,10 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
             config,
             now,
         );
-        // A hung storage call must not hold the cleanup worker indefinitely;
-        // a timed-out round reports and the next round starts over.
+        // Bounds the round's asynchronous waits (a pending storage request,
+        // the paged metadata scan); a synchronous filesystem call is not
+        // interrupted. A timed-out round reports and the next round starts
+        // over; deletes already performed stay performed.
         self.runtime
             .with_timeout(
                 "search_segment_gc_round",
