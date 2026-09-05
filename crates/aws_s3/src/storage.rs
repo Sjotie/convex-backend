@@ -573,13 +573,25 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
                 let relative_key = s3_key
                     .strip_prefix(&self.key_prefix)
                     .with_context(|| format!("S3 key {s3_key:?} missing storage prefix"))?;
+                if relative_key.is_empty() {
+                    // A zero-byte "directory marker" at the prefix itself
+                    // is not an object of ours.
+                    continue;
+                }
                 let key = ObjectKey::try_from(relative_key)?;
                 let last_modified = *object
                     .last_modified()
                     .context("S3 object missing last_modified")?;
                 let last_modified = SystemTime::try_from(last_modified)
                     .context("S3 last_modified isn't valid SystemTime")?;
-                objects.push(ObjectListing { key, last_modified });
+                let size = object.size().context("S3 object missing size")?;
+                let size = u64::try_from(size)
+                    .with_context(|| format!("S3 object size {size} is negative"))?;
+                objects.push(ObjectListing {
+                    key,
+                    last_modified,
+                    size,
+                });
             }
         }
         Ok(objects)

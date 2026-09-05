@@ -853,6 +853,47 @@ pub static MAX_EXPIRED_SNAPSHOT_AGE: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_days(days)
 });
 
+/// Controls the search-segment garbage collector that runs as part of the
+/// system table cleanup worker. Text and vector index segments are uploaded
+/// to search storage before the `_index` revision that references them is
+/// committed, and a flush or compaction that replaces a segment never deletes
+/// the previous one, so without external lifecycle rules (which self-hosted
+/// deployments do not have) search storage grows without bound. The collector
+/// lists search storage and removes objects that no retained `_index`
+/// revision references.
+///
+/// Values: `off` (default) — do nothing; `dry_run` — compute and log what
+/// would be removed without deleting anything; `delete` — remove orphans.
+/// Deletion is irreversible, so the recommended rollout is `dry_run` first,
+/// comparing its log against an independent view of the referenced segments,
+/// and only then `delete`. Any other value is reported as an error every round
+/// and behaves like `off`.
+///
+/// The collector assumes this backend is the only writer of its search
+/// storage. Leave it `off` on a deployment that shares a storage directory or
+/// S3 prefix with another backend (for example a clone restored without a
+/// fresh prefix): each would treat the other's segments as orphans.
+pub static SEARCH_SEGMENT_GC_MODE: LazyLock<String> =
+    LazyLock::new(|| env_config("SEARCH_SEGMENT_GC_MODE", "off".to_string()));
+
+/// An unreferenced search storage object is only eligible for garbage
+/// collection once it is at least this old. This covers the window between a
+/// segment upload finishing and the `_index` revision that references it
+/// committing, and absorbs clock skew between storage and the backend. Values
+/// below the collector's floor (10 minutes) are rejected.
+pub static SEARCH_SEGMENT_GC_MIN_OBJECT_AGE: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config(
+        "SEARCH_SEGMENT_GC_MIN_OBJECT_AGE_SECONDS",
+        24 * 60 * 60,
+    ))
+});
+
+/// Upper bound on the number of orphaned search storage objects one
+/// collection round deletes; the rest wait for a later round. Bounds how long
+/// a round can occupy the system table cleanup worker after a large backlog.
+pub static SEARCH_SEGMENT_GC_MAX_DELETES_PER_ROUND: LazyLock<usize> =
+    LazyLock::new(|| env_config("SEARCH_SEGMENT_GC_MAX_DELETES_PER_ROUND", 1000));
+
 /// Number of chunks processed per second when calculating table summaries.
 pub static TABLE_SUMMARY_CHUNKS_PER_SECOND: LazyLock<NonZeroU32> = LazyLock::new(|| {
     env_config(

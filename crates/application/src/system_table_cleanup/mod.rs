@@ -88,9 +88,16 @@ use value::{
     TabletId,
 };
 
-use crate::system_table_cleanup::metrics::log_tablet_hard_deleted;
+use crate::system_table_cleanup::{
+    metrics::log_tablet_hard_deleted,
+    search_segment_gc::{
+        SearchSegmentGcConfig,
+        SearchSegmentGcMode,
+    },
+};
 
 mod metrics;
+pub mod search_segment_gc;
 
 const MAX_ORPHANED_TABLE_NAMESPACE_AGE: Duration = Duration::from_days(2);
 const MAX_INDEX_BACKFILLS_PER_RUN: usize = 1000;
@@ -101,6 +108,9 @@ pub struct SystemTableCleanupWorker<RT: Runtime> {
     database: Database<RT>,
     runtime: RT,
     exports_storage: Arc<dyn Storage>,
+    /// The storage that holds text and vector index segments
+    /// (`StorageUseCase::SearchIndexes`). Nothing else writes to it.
+    search_storage: Arc<dyn Storage>,
 }
 
 impl<RT: Runtime> SystemTableCleanupWorker<RT> {
@@ -109,12 +119,14 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
         runtime: RT,
         database: Database<RT>,
         exports_storage: Arc<dyn Storage>,
+        search_storage: Arc<dyn Storage>,
         deleted_tablet_receiver: mpsc::Receiver<TabletId>,
     ) -> impl Future<Output = ()> + Send {
         let mut worker = SystemTableCleanupWorker {
             database: database.clone(),
             runtime: runtime.clone(),
             exports_storage,
+            search_storage,
         };
         async move {
             if MAX_SESSION_CLEANUP_DURATION.is_none() {
@@ -152,6 +164,11 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
             self.cleanup_index_backfills().await?;
             self.cleanup_expired_exports().await?;
             self.cleanup_unused_source_packages().await?;
+            // Keep a failing segment collection from blocking the cleanups
+            // below: it reports and retries next round.
+            if let Err(e) = self.cleanup_orphaned_search_segments(&rate_limiter).await {
+                report_error(&mut e.context("cleanup_orphaned_search_segments failed")).await;
+            }
 
             // _session_requests are used to make mutations idempotent.
             // We can delete them after they are old enough that the client that
@@ -505,6 +522,31 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
         if num_deleted > 0 {
             tracing::info!("Deleted {num_deleted} expired snapshots");
         }
+        Ok(())
+    }
+
+    /// Remove text/vector index segments in search storage that no retained
+    /// `_index` revision references. See `search_segment_gc` for the rules;
+    /// `SEARCH_SEGMENT_GC_MODE` (default `off`) turns it on.
+    async fn cleanup_orphaned_search_segments(
+        &self,
+        rate_limiter: &RateLimiter<RT>,
+    ) -> anyhow::Result<()> {
+        let config = SearchSegmentGcConfig::from_knobs()?;
+        if config.mode == SearchSegmentGcMode::Off {
+            return Ok(());
+        }
+        // Read the clock before the keep set is built so anything uploaded
+        // while we scan is too young to touch by construction.
+        let now = self.runtime.system_time();
+        search_segment_gc::collect_orphaned_search_segments(
+            &self.database,
+            &self.search_storage,
+            rate_limiter,
+            config,
+            now,
+        )
+        .await?;
         Ok(())
     }
 

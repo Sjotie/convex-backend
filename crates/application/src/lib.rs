@@ -799,6 +799,7 @@ impl<RT: Runtime> Application<RT> {
             runtime.clone(),
             database.clone(),
             application_storage.exports_storage.clone(),
+            application_storage.search_storage.clone(),
             deleted_tablet_receiver,
         );
         let system_table_cleanup_worker = Arc::new(Mutex::new(

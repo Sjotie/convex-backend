@@ -220,6 +220,8 @@ pub struct ObjectAttributes {
 pub struct ObjectListing {
     pub key: ObjectKey,
     pub last_modified: SystemTime,
+    /// Size of the object in bytes.
+    pub size: u64,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -1112,17 +1114,20 @@ impl<RT: Runtime> Storage for LocalDirStorage<RT> {
     }
 
     async fn list_objects(&self, key_prefix: &str) -> anyhow::Result<Vec<ObjectListing>> {
-        fn walk(dir: &Path, out: &mut Vec<(PathBuf, SystemTime)>) -> anyhow::Result<()> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, SystemTime, u64)>) -> anyhow::Result<()> {
             if !dir.exists() {
                 return Ok(());
             }
             for entry in fs::read_dir(dir)? {
                 let entry = entry?;
                 let path = entry.path();
-                if path.is_dir() {
+                // Never follow symlinks: a link under the storage root could
+                // point outside it, and a listing feeds deletions.
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.is_dir() {
                     walk(&path, out)?;
-                } else {
-                    out.push((path, entry.metadata()?.modified()?));
+                } else if metadata.is_file() {
+                    out.push((path, metadata.modified()?, metadata.len()));
                 }
             }
             Ok(())
@@ -1131,7 +1136,7 @@ impl<RT: Runtime> Storage for LocalDirStorage<RT> {
         let mut files = Vec::new();
         walk(&self.dir, &mut files)?;
         let mut objects = Vec::new();
-        for (path, last_modified) in files {
+        for (path, last_modified, size) in files {
             let relative = path.strip_prefix(&self.dir)?.to_string_lossy();
             let Some(key) = relative.strip_suffix(".blob") else {
                 continue;
@@ -1142,6 +1147,7 @@ impl<RT: Runtime> Storage for LocalDirStorage<RT> {
             objects.push(ObjectListing {
                 key: ObjectKey::try_from(key)?,
                 last_modified,
+                size,
             });
         }
         Ok(objects)
