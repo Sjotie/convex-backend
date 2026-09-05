@@ -195,6 +195,13 @@ impl<RT: Runtime, T: SearchIndex> SearchIndexCompactor<RT, T> {
 
     async fn build_one(&self, job: CompactionJob<T>) -> anyhow::Result<u64> {
         let timer = compaction_build_one_timer(Self::search_type(), job.compaction_reason);
+        // Registered until the metadata commit below has returned (or this
+        // compaction fails), so the search segment garbage collector never
+        // treats the compacted segment as unreferenced while it is pending.
+        let _active_build = self
+            .database
+            .active_search_index_builds()
+            .begin(self.database.runtime().system_time());
         match self.build_one_inner(job).await {
             Ok(total_compacted_segments) => {
                 timer.finish();

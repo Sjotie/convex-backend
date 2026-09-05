@@ -187,6 +187,7 @@ use vector::{
     VectorSearch,
 };
 
+use crate::search_index_builds::ActiveSearchIndexBuilds;
 use crate::{
     bootstrap_model::{
         next_persistence_index_id::types::NextPersistenceIndexIdMetadata,
@@ -324,6 +325,9 @@ pub struct Database<RT: Runtime> {
     retention_workers: LeaderRetentionWorkers,
     pub searcher: Arc<dyn Searcher>,
     pub search_storage: Arc<OnceLock<Arc<dyn Storage>>>,
+    /// Text/vector index builds currently between uploading segments and
+    /// committing the metadata that references them.
+    active_search_index_builds: Arc<ActiveSearchIndexBuilds>,
     index_cache_handle: Option<IndexCacheHandle>,
     virtual_system_mapping: VirtualSystemMapping,
     pub bootstrap_metadata: BootstrapMetadata,
@@ -1115,6 +1119,7 @@ impl<RT: Runtime> Database<RT> {
             write_commits_since_load: Arc::new(AtomicUsize::new(0)),
             searcher,
             search_storage: Arc::new(OnceLock::new()),
+            active_search_index_builds: ActiveSearchIndexBuilds::new(),
             index_cache_handle: Some(index_cache_handle),
             virtual_system_mapping,
             bootstrap_metadata,
@@ -2565,6 +2570,13 @@ impl<RT: Runtime> Database<RT> {
             .latest_snapshot()
             .table_counts
             .is_some()
+    }
+
+    /// Registry of in-flight text/vector index builds. Writers register a
+    /// build around its uploads and metadata commit; the search segment
+    /// garbage collector defers a round that overlaps such a build.
+    pub fn active_search_index_builds(&self) -> Arc<ActiveSearchIndexBuilds> {
+        self.active_search_index_builds.clone()
     }
 
     pub fn search_storage(&self) -> Arc<dyn Storage> {

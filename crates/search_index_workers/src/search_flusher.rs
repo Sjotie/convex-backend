@@ -244,6 +244,13 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
         build_args: T::BuildIndexArgs,
     ) -> anyhow::Result<u64> {
         let timer = build_one_search_index_timer(T::search_type());
+        // Registered until the metadata commit below has returned (or this
+        // build fails), so the search segment garbage collector never treats
+        // the segments uploaded here as unreferenced while they are pending.
+        let _active_build = self
+            .database
+            .active_search_index_builds()
+            .begin(self.runtime.system_time());
         match self.build_one_inner(job, build_args).await {
             Ok(num_documents) => {
                 timer.finish();

@@ -25,6 +25,7 @@ pub mod reads;
 mod retention;
 mod search_flusher_wake;
 mod search_index_bootstrap;
+mod search_index_builds;
 mod snapshot_manager;
 mod stack_traces;
 pub mod streaming_export_selection;
@@ -82,6 +83,10 @@ pub use search_flusher_wake::{
     SearchFlusherWakeSubscriber,
 };
 pub use search_index_bootstrap::FINISHED_BOOTSTRAP_UPDATES;
+pub use search_index_builds::{
+    ActiveSearchIndexBuildGuard,
+    ActiveSearchIndexBuilds,
+};
 pub use table_iteration::{
     data_sync::{
         DataSyncCursor,

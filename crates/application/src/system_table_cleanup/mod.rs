@@ -18,6 +18,7 @@ use common::{
         MAX_EXPIRED_SNAPSHOT_AGE,
         MAX_IMPORT_AGE,
         MAX_SESSION_CLEANUP_DURATION,
+        SEARCH_SEGMENT_GC_ROUND_TIMEOUT,
         SESSION_CLEANUP_DELETE_CONCURRENCY,
         SYSTEM_TABLE_CLEANUP_CHUNK_SIZE,
         SYSTEM_TABLE_CLEANUP_FREQUENCY,
@@ -34,6 +35,7 @@ use common::{
         new_rate_limiter,
         RateLimiter,
         Runtime,
+        WithTimeout,
     },
     types::{
         IndexName,
@@ -539,14 +541,24 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
         // Read the clock before the keep set is built so anything uploaded
         // while we scan is too young to touch by construction.
         let now = self.runtime.system_time();
-        search_segment_gc::collect_orphaned_search_segments(
+        let active_builds = self.database.active_search_index_builds();
+        let round = search_segment_gc::collect_orphaned_search_segments(
             &self.database,
             &self.search_storage,
+            &active_builds,
             rate_limiter,
             config,
             now,
-        )
-        .await?;
+        );
+        // A hung storage call must not hold the cleanup worker indefinitely;
+        // a timed-out round reports and the next round starts over.
+        self.runtime
+            .with_timeout(
+                "search_segment_gc_round",
+                *SEARCH_SEGMENT_GC_ROUND_TIMEOUT,
+                round,
+            )
+            .await?;
         Ok(())
     }
 

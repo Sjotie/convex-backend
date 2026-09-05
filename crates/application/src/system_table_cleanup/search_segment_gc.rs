@@ -36,7 +36,18 @@
 //!    `MIN_OBJECT_AGE_FLOOR`. Note that S3 dates a multipart object from the
 //!    start of its upload, so on S3 the effective margin is the knob minus the
 //!    upload duration; the 24-hour default is sized for that, the floor is not.
-//! 3. Refuse to delete anything when the keep set protects none of the listed
+//! 3. Defer the round when a text/vector index build (flush or compaction) that
+//!    started before the round did is still running. Such a build may have
+//!    uploaded segments that no retained `_index` revision mentions yet, and
+//!    their object dates give no protection (a stalled upload is old, and S3
+//!    dates a multipart object from its initiation). Builds register themselves
+//!    in `ActiveSearchIndexBuilds` around upload and commit; the registry is
+//!    read *before* the keep set, so every build that could still commit an
+//!    object older than the round is either seen there (and defers the round)
+//!    or started after the round's clock reading (and its objects are too
+//!    young). A build that ended before the reading has either committed — and
+//!    is in the keep set — or abandoned its objects.
+//! 4. Refuse to delete anything when the keep set protects none of the listed
 //!    objects: a deployment whose search storage does not match its metadata
 //!    (wrong directory, wrong prefix) would otherwise lose every segment it
 //!    has. Dry runs still report in that case, flagged as refused.
@@ -82,6 +93,7 @@ use common::{
     document::{
         ParseDocument,
         ParsedDocument,
+        ResolvedDocument,
     },
     knobs::{
         SEARCH_SEGMENT_GC_MAX_DELETES_PER_ROUND,
@@ -96,7 +108,10 @@ use common::{
     },
     types::RepeatableTimestamp,
 };
-use database::Database;
+use database::{
+    ActiveSearchIndexBuilds,
+    Database,
+};
 use futures::{
     pin_mut,
     TryStreamExt,
@@ -246,6 +261,16 @@ fn ensure_known_index_format(config: &IndexConfig) -> anyhow::Result<()> {
     }
 }
 
+/// Parse an `_index` document and reject it unless its text/vector snapshot
+/// format is one this code knows.
+fn ensure_known_index_document(document: &ResolvedDocument) -> anyhow::Result<()> {
+    let metadata: ParsedDocument<TabletIndexMetadata> = document
+        .parse()
+        .context("Cannot parse an _index document as index metadata")?;
+    ensure_known_index_format(&metadata.config)
+        .with_context(|| format!("_index document {}", metadata.name))
+}
+
 /// Add every string value reachable from `value` to `out`.
 fn collect_strings(value: &ConvexValue, out: &mut BTreeSet<String>) {
     match value {
@@ -326,12 +351,7 @@ async fn search_segment_keep_set<RT: Runtime>(
         // only prove that the current metadata format is one this code was
         // written against.
         collect_object_strings(&document.value.value().0, &mut strings);
-        let metadata: ParsedDocument<TabletIndexMetadata> = document
-            .value
-            .parse()
-            .context("Cannot parse an _index document as index metadata")?;
-        ensure_known_index_format(&metadata.config)
-            .with_context(|| format!("_index document {}", metadata.name))?;
+        ensure_known_index_document(&document.value)?;
         snapshot_documents += 1;
     }
 
@@ -346,6 +366,7 @@ async fn search_segment_keep_set<RT: Runtime>(
     while let Some(pair) = revision_stream.try_next().await? {
         if let Some(document) = &pair.rev.document {
             collect_object_strings(&document.value().0, &mut strings);
+            ensure_known_index_document(document)?;
         }
         log_revisions += 1;
         if let Some(prev_rev) = &pair.prev_rev {
@@ -362,6 +383,7 @@ async fn search_segment_keep_set<RT: Runtime>(
                 )
             })?;
             collect_object_strings(&document.value().0, &mut strings);
+            ensure_known_index_document(document)?;
             log_revisions += 1;
         }
     }
@@ -454,6 +476,9 @@ pub enum RoundOutcome {
     Completed,
     /// Storage holds objects but the keep set references none of them.
     Refused,
+    /// An index build that started before the round is still running, so the
+    /// keep set cannot be complete for its objects.
+    Deferred,
 }
 
 impl RoundOutcome {
@@ -461,8 +486,21 @@ impl RoundOutcome {
         match self {
             Self::Completed => "completed",
             Self::Refused => "refused",
+            Self::Deferred => "deferred",
         }
     }
+}
+
+/// Whether a running build that started at `oldest_build_started` blocks a
+/// round whose clock was read at `now`. Builds that started at or before the
+/// reading may own objects that are older than the round and still
+/// uncommitted; builds that started after it can only own objects the age
+/// check already protects.
+pub fn active_build_blocks_round(
+    oldest_build_started: Option<SystemTime>,
+    now: SystemTime,
+) -> bool {
+    matches!(oldest_build_started, Some(started) if started <= now)
 }
 
 /// What one collection round did.
@@ -489,6 +527,7 @@ pub struct SearchSegmentGcSummary {
 pub async fn collect_orphaned_search_segments<RT: Runtime>(
     database: &Database<RT>,
     search_storage: &Arc<dyn Storage>,
+    active_builds: &ActiveSearchIndexBuilds,
     rate_limiter: &RateLimiter<RT>,
     config: SearchSegmentGcConfig,
     now: SystemTime,
@@ -499,11 +538,17 @@ pub async fn collect_orphaned_search_segments<RT: Runtime>(
         "collect_orphaned_search_segments called with mode off"
     );
     let _timer = search_segment_gc_timer();
+    // Must be read before the keep set: see the module docs. `now` was read
+    // before this call.
+    let oldest_active_build = active_builds.oldest_started();
+    let blocked_by_build = active_build_blocks_round(oldest_active_build, now);
     let keep = search_segment_keep_set(database, rate_limiter).await?;
     let listing = search_storage.list_objects("").await?;
     let listed = listing.len();
     let selection = select_orphans(listing, &keep.strings, now, config.min_object_age);
-    let outcome = if keep_set_covers_storage(listed, selection.referenced) {
+    let outcome = if blocked_by_build {
+        RoundOutcome::Deferred
+    } else if keep_set_covers_storage(listed, selection.referenced) {
         RoundOutcome::Completed
     } else {
         RoundOutcome::Refused
@@ -529,8 +574,8 @@ pub async fn collect_orphaned_search_segments<RT: Runtime>(
     let mut deferred = 0;
     match (mode, outcome) {
         (SearchSegmentGcMode::Off, _) => unreachable!("mode off was rejected above"),
-        (SearchSegmentGcMode::DryRun, _) | (SearchSegmentGcMode::Delete, RoundOutcome::Refused) => {
-        },
+        (SearchSegmentGcMode::DryRun, _)
+        | (SearchSegmentGcMode::Delete, RoundOutcome::Refused | RoundOutcome::Deferred) => {},
         (SearchSegmentGcMode::Delete, RoundOutcome::Completed) => {
             for object in &selection.orphans {
                 if deleted + failed >= config.max_deletes_per_round {
@@ -571,12 +616,18 @@ pub async fn collect_orphaned_search_segments<RT: Runtime>(
     log_search_segment_gc_objects("deleted", summary.deleted as u64);
     log_search_segment_gc_objects("failed", summary.failed as u64);
     log_search_segment_gc_round(outcome.as_str());
-    if outcome == RoundOutcome::Refused {
-        tracing::warn!(
+    match outcome {
+        RoundOutcome::Completed => {},
+        RoundOutcome::Refused => tracing::warn!(
             "Search segment GC refused to collect: {listed} objects listed but none is referenced \
              by any retained _index revision. Search storage and index metadata do not match; \
              nothing was deleted."
-        );
+        ),
+        RoundOutcome::Deferred => tracing::info!(
+            "Search segment GC deferred: an index build that started at {:?} (before this round \
+             read its clock at {now:?}) is still running; nothing was deleted.",
+            oldest_active_build,
+        ),
     }
     tracing::info!(
         "Search segment GC ({mode}, {outcome}): {listed} objects listed, {referenced} referenced \
@@ -651,6 +702,7 @@ mod tests {
     };
 
     use super::{
+        active_build_blocks_round,
         collect_object_strings,
         ensure_known_index_format,
         keep_set_covers_storage,
@@ -846,6 +898,26 @@ mod tests {
         let selection = select_orphans(vec![future], &keep, now, Duration::from_secs(1));
         assert!(selection.orphans.is_empty());
         assert_eq!(selection.too_young, 1);
+    }
+
+    #[test]
+    fn a_build_that_started_before_the_round_blocks_it() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        // No build running: nothing to wait for.
+        assert!(!active_build_blocks_round(None, now));
+        // A build that started before (or exactly at) the round's clock
+        // reading may still commit objects older than the round.
+        assert!(active_build_blocks_round(
+            Some(now - Duration::from_secs(1)),
+            now
+        ));
+        assert!(active_build_blocks_round(Some(now), now));
+        // A build that started after the reading can only produce objects
+        // younger than the round, which the age check protects.
+        assert!(!active_build_blocks_round(
+            Some(now + Duration::from_secs(1)),
+            now
+        ));
     }
 
     #[test]

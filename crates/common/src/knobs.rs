@@ -895,6 +895,17 @@ pub static SEARCH_SEGMENT_GC_MIN_OBJECT_AGE: LazyLock<Duration> = LazyLock::new(
 pub static SEARCH_SEGMENT_GC_MAX_DELETES_PER_ROUND: LazyLock<usize> =
     LazyLock::new(|| env_config("SEARCH_SEGMENT_GC_MAX_DELETES_PER_ROUND", 1000));
 
+/// Upper bound on the wall-clock duration of one search segment garbage
+/// collection round (keep set, listing and deletes together). A round that
+/// exceeds it is abandoned with an error and retried by the next round, so a
+/// hung storage call cannot hold the system table cleanup worker.
+pub static SEARCH_SEGMENT_GC_ROUND_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(env_config(
+        "SEARCH_SEGMENT_GC_ROUND_TIMEOUT_SECONDS",
+        15 * 60,
+    ))
+});
+
 /// Number of chunks processed per second when calculating table summaries.
 pub static TABLE_SUMMARY_CHUNKS_PER_SECOND: LazyLock<NonZeroU32> = LazyLock::new(|| {
     env_config(
