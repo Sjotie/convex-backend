@@ -22,9 +22,11 @@
 //!    MVCC readers: a segment that was swapped out a moment ago is still
 //!    visible to a transaction at an older snapshot, and shows up here as the
 //!    `prev_rev` of the change that replaced it. Every document of the current
-//!    snapshot must additionally parse as `TabletIndexMetadata`, so a metadata
-//!    format this code does not understand stops the round instead of being
-//!    harvested incompletely.
+//!    snapshot must additionally parse as `TabletIndexMetadata` with a text or
+//!    vector snapshot in a format this code knows (the parser deliberately
+//!    round-trips unknown formats as `Unknown`), so a metadata format this code
+//!    was not written against stops the round instead of being harvested
+//!    incompletely.
 //! 2. List search storage and select objects that are absent from the keep set
 //!    and older than `SEARCH_SEGMENT_GC_MIN_OBJECT_AGE`. The age floor covers
 //!    the window between an upload finishing and its `_index` revision
@@ -63,7 +65,18 @@ use std::{
 
 use anyhow::Context as _;
 use common::{
-    bootstrap_model::index::TabletIndexMetadata,
+    bootstrap_model::index::{
+        text_index::{
+            TextIndexSnapshotData,
+            TextIndexState,
+        },
+        vector_index::{
+            VectorIndexSnapshotData,
+            VectorIndexState,
+        },
+        IndexConfig,
+        TabletIndexMetadata,
+    },
     document::{
         ParseDocument,
         ParsedDocument,
@@ -193,6 +206,44 @@ impl SearchSegmentGcConfig {
     }
 }
 
+/// Reject index metadata whose on-disk snapshot is in a format this code does
+/// not know. The metadata parsers deliberately keep unrecognized snapshot
+/// data as `Unknown` so that services can roll forwards and backwards without
+/// rewriting `_index`; for a collector that decides what to delete, an unknown
+/// format must instead stop the round, because its object keys may be stored
+/// in a shape the string harvest does not see.
+fn ensure_known_index_format(config: &IndexConfig) -> anyhow::Result<()> {
+    match config {
+        IndexConfig::Database { .. } => Ok(()),
+        IndexConfig::Text { on_disk_state, .. } => {
+            let data = match on_disk_state {
+                TextIndexState::Backfilling(_) => return Ok(()),
+                TextIndexState::Backfilled { snapshot, .. }
+                | TextIndexState::SnapshottedAt(snapshot) => &snapshot.data,
+            };
+            match data {
+                TextIndexSnapshotData::MultiSegment(_) => Ok(()),
+                TextIndexSnapshotData::Unknown(_) => {
+                    anyhow::bail!("Text index snapshot is in an unknown format")
+                },
+            }
+        },
+        IndexConfig::Vector { on_disk_state, .. } => {
+            let data = match on_disk_state {
+                VectorIndexState::Backfilling(_) => return Ok(()),
+                VectorIndexState::Backfilled { snapshot, .. }
+                | VectorIndexState::SnapshottedAt(snapshot) => &snapshot.data,
+            };
+            match data {
+                VectorIndexSnapshotData::MultiSegment(_) => Ok(()),
+                VectorIndexSnapshotData::Unknown(_) => {
+                    anyhow::bail!("Vector index snapshot is in an unknown format")
+                },
+            }
+        },
+    }
+}
+
 /// Add every string value reachable from `value` to `out`.
 fn collect_strings(value: &ConvexValue, out: &mut BTreeSet<String>) {
     match value {
@@ -269,13 +320,16 @@ async fn search_segment_keep_set<RT: Runtime>(
         .stream_documents_in_table(index_tablet_id, index_by_id, None);
     pin_mut!(snapshot_stream);
     while let Some(document) = snapshot_stream.try_next().await? {
-        // The strings are the root set; the typed parse only proves that the
-        // current metadata format is one this code was written against.
+        // The strings are the root set; the typed parse plus the format check
+        // only prove that the current metadata format is one this code was
+        // written against.
         collect_object_strings(&document.value.value().0, &mut strings);
-        let _: ParsedDocument<TabletIndexMetadata> = document
+        let metadata: ParsedDocument<TabletIndexMetadata> = document
             .value
             .parse()
             .context("Cannot parse an _index document as index metadata")?;
+        ensure_known_index_format(&metadata.config)
+            .with_context(|| format!("_index document {}", metadata.name))?;
         snapshot_documents += 1;
     }
 
@@ -563,16 +617,40 @@ mod tests {
         },
     };
 
-    use common::types::ObjectKey;
+    use common::{
+        bootstrap_model::index::{
+            text_index::{
+                TextIndexSnapshot,
+                TextIndexSnapshotData,
+                TextIndexSpec,
+                TextIndexState,
+                TextSnapshotVersion,
+            },
+            vector_index::{
+                VectorDimensions,
+                VectorIndexSnapshot,
+                VectorIndexSnapshotData,
+                VectorIndexSpec,
+                VectorIndexState,
+            },
+            IndexConfig,
+        },
+        types::{
+            ObjectKey,
+            Timestamp,
+        },
+    };
     use storage::ObjectListing;
     use value::{
         ConvexObject,
         ConvexValue,
         FieldName,
+        FieldPath,
     };
 
     use super::{
         collect_object_strings,
+        ensure_known_index_format,
         keep_set_covers_storage,
         orphan_digest,
         select_orphans,
@@ -674,6 +752,57 @@ mod tests {
             .map(str::to_owned)
             .collect();
         assert_eq!(strings, expected);
+    }
+
+    #[test]
+    fn unknown_snapshot_formats_stop_the_round() {
+        let text_spec = TextIndexSpec {
+            search_field: "body".parse::<FieldPath>().unwrap(),
+            filter_fields: BTreeSet::new(),
+        };
+        let text = |data: TextIndexSnapshotData| IndexConfig::Text {
+            spec: text_spec.clone(),
+            on_disk_state: TextIndexState::SnapshottedAt(TextIndexSnapshot {
+                data,
+                ts: Timestamp::MIN,
+                version: TextSnapshotVersion::V0,
+            }),
+        };
+        assert!(
+            ensure_known_index_format(&text(TextIndexSnapshotData::MultiSegment(vec![]))).is_ok()
+        );
+        // The parser round-trips formats it does not recognize as `Unknown`
+        // instead of failing; the collector must not treat that as parsed.
+        assert!(
+            ensure_known_index_format(&text(TextIndexSnapshotData::Unknown(ConvexObject::empty())))
+                .is_err()
+        );
+
+        let vector_spec = VectorIndexSpec {
+            dimensions: VectorDimensions::try_from(64u32).unwrap(),
+            vector_field: "embedding".parse::<FieldPath>().unwrap(),
+            filter_fields: BTreeSet::new(),
+        };
+        let vector = |data: VectorIndexSnapshotData| IndexConfig::Vector {
+            spec: vector_spec.clone(),
+            on_disk_state: VectorIndexState::Backfilled {
+                snapshot: VectorIndexSnapshot {
+                    data,
+                    ts: Timestamp::MIN,
+                },
+                staged: false,
+            },
+        };
+        assert!(
+            ensure_known_index_format(&vector(VectorIndexSnapshotData::MultiSegment(vec![])))
+                .is_ok()
+        );
+        assert!(
+            ensure_known_index_format(&vector(VectorIndexSnapshotData::Unknown(
+                ConvexObject::empty()
+            )))
+            .is_err()
+        );
     }
 
     #[test]
